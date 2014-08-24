@@ -467,23 +467,57 @@ int registerfile(filetree_t **branch, file_t *file)
   return 1;
 }
 
+/* Do a bit-for-bit comparison in case two different files produce the
+   same signature. Unlikely, but better safe than sorry. */
+
+int confirmmatch(FILE *file1, FILE *file2)
+{
+  unsigned char c1 = 0;
+  unsigned char c2 = 0;
+  size_t r1;
+  size_t r2;
+
+  fseek(file1, 0, SEEK_SET);
+  fseek(file2, 0, SEEK_SET);
+
+  do {
+    r1 = fread(&c1, sizeof(c1), 1, file1);
+    r2 = fread(&c2, sizeof(c2), 1, file2);
+
+    if (c1 != c2) return 0; /* file contents are different */
+  } while (r1 && r2);
+
+  if (r1 != r2) return 0; /* file lengths are different */
+
+  return 1;
+}
+
 file_t **checkmatch(filetree_t **root, filetree_t *checktree, file_t *file)
 {
   int cmpresult;
   char *crcsignature;
   off_t fsize;
 
+  int ishardlink = ((checktree->file->inode) && getinode(file->d_name) == checktree->file->inode) &&
+    (getdevice(file->d_name) == checktree->file->device);
+
   /* If device and inode fields are equal one of the files is a 
      hard link to the other or the files have been listed twice 
      unintentionally. We don't want to flag these files as
      duplicates unless the user specifies otherwise.
-  */    
 
-  if (!ISFLAG(flags, F_CONSIDERHARDLINKS) && (getinode(file->d_name) == 
-      checktree->file->inode) && (getdevice(file->d_name) ==
-      checktree->file->device)) return NULL; 
+     If files are linked to same inode, don't recompute checksum, and
+     bypass full file comparison.
+  */
 
-  fsize = filesize(file->d_name);
+  if (ishardlink) {
+    if (!ISFLAG(flags, F_CONSIDERHARDLINKS))
+      return NULL;
+    //get original file size in case file is being modified.
+    fsize = checktree->file->size;
+  } else {
+    fsize = filesize(file->d_name);
+  }
   
   if (fsize < checktree->file->size) 
     cmpresult = -1;
@@ -491,58 +525,67 @@ file_t **checkmatch(filetree_t **root, filetree_t *checktree, file_t *file)
     if (fsize > checktree->file->size) cmpresult = 1;
   else {
     if (checktree->file->crcpartial == NULL) {
-      crcsignature = getcrcpartialsignature(checktree->file->d_name);
+      if (ishardlink && (file->crcpartial != NULL))
+	crcsignature = file->crcpartial;
+      else
+	crcsignature = getcrcpartialsignature(checktree->file->d_name);
+
       if (crcsignature == NULL) return NULL;
 
-      checktree->file->crcpartial = (char*) malloc(strlen(crcsignature)+1);
+      checktree->file->crcpartial = strdup(crcsignature);
       if (checktree->file->crcpartial == NULL) {
 	errormsg("out of memory\n");
 	exit(1);
       }
-      strcpy(checktree->file->crcpartial, crcsignature);
     }
 
     if (file->crcpartial == NULL) {
-      crcsignature = getcrcpartialsignature(file->d_name);
+      if (ishardlink && (checktree->file->crcpartial != NULL))
+	crcsignature = checktree->file->crcpartial;
+      else
+	crcsignature = getcrcpartialsignature(file->d_name);
       if (crcsignature == NULL) return NULL;
 
-      file->crcpartial = (char*) malloc(strlen(crcsignature)+1);
+      file->crcpartial = (char*) strdup(crcsignature);
       if (file->crcpartial == NULL) {
 	errormsg("out of memory\n");
 	exit(1);
       }
-      strcpy(file->crcpartial, crcsignature);
     }
 
-    cmpresult = strcmp(file->crcpartial, checktree->file->crcpartial);
+    cmpresult = ishardlink ? 0 : strcmp(file->crcpartial, checktree->file->crcpartial);
     /*if (cmpresult != 0) errormsg("    on %s vs %s\n", file->d_name, checktree->file->d_name);*/
 
     if (cmpresult == 0) {
       if (checktree->file->crcsignature == NULL) {
-	crcsignature = getcrcsignature(checktree->file->d_name);
+	if (ishardlink && (file->crcsignature != NULL))
+	  crcsignature = file->crcsignature;
+	else
+	  crcsignature = getcrcsignature(checktree->file->d_name);
 	if (crcsignature == NULL) return NULL;
 
-	checktree->file->crcsignature = (char*) malloc(strlen(crcsignature)+1);
+	checktree->file->crcsignature = strdup(crcsignature);
 	if (checktree->file->crcsignature == NULL) {
 	  errormsg("out of memory\n");
 	  exit(1);
 	}
-	strcpy(checktree->file->crcsignature, crcsignature);
       }
 
       if (file->crcsignature == NULL) {
-	crcsignature = getcrcsignature(file->d_name);
+	if (ishardlink && (checktree->file->crcsignature != NULL))
+	  crcsignature = checktree->file->crcsignature;
+	else
+	  crcsignature = getcrcsignature(file->d_name);
 	if (crcsignature == NULL) return NULL;
 
-	file->crcsignature = (char*) malloc(strlen(crcsignature)+1);
+	file->crcsignature = strdup(crcsignature);
 	if (file->crcsignature == NULL) {
 	  errormsg("out of memory\n");
 	  exit(1);
 	}
-	strcpy(file->crcsignature, crcsignature);
       }
 
-      cmpresult = strcmp(file->crcsignature, checktree->file->crcsignature);
+      cmpresult = ishardlink ? 0 : strcmp(file->crcsignature, checktree->file->crcsignature);
       /*if (cmpresult != 0) errormsg("P   on %s vs %s\n", 
           file->d_name, checktree->file->d_name);
       else errormsg("P F on %s vs %s\n", file->d_name,
@@ -565,36 +608,32 @@ file_t **checkmatch(filetree_t **root, filetree_t *checktree, file_t *file)
       registerfile(&(checktree->right), file);
       return NULL;
     }
-  } else 
-  {
+  } else {
     getfilestats(file);
+
+    if (ishardlink)
+      file->size = fsize;//force fsize to hl values for files being modified // good idea???
+    else {
+      //confirm match directly here.
+      FILE *file1 = fopen(checktree->file->d_name, "rb");
+      if (!file1)
+	return NULL;
+
+      FILE *file2 = fopen(file->d_name, "rb");
+      if (!file2) {
+	fclose(file1);
+	return NULL;
+      }
+      if (!confirmmatch(file1,file2)) {
+	fclose(file1);
+	fclose(file2);
+	return NULL;
+      }
+      fclose(file1);
+      fclose(file2);
+    }
     return &checktree->file;
   }
-}
-
-/* Do a bit-for-bit comparison in case two different files produce the 
-   same signature. Unlikely, but better safe than sorry. */
-
-int confirmmatch(FILE *file1, FILE *file2)
-{
-  unsigned char c1 = 0;
-  unsigned char c2 = 0;
-  size_t r1;
-  size_t r2;
-  
-  fseek(file1, 0, SEEK_SET);
-  fseek(file2, 0, SEEK_SET);
-
-  do {
-    r1 = fread(&c1, sizeof(c1), 1, file1);
-    r2 = fread(&c2, sizeof(c2), 1, file2);
-
-    if (c1 != c2) return 0; /* file contents are different */
-  } while (r1 && r2);
-  
-  if (r1 != r2) return 0; /* file lengths are different */
-
-  return 1;
 }
 
 void summarizematches(file_t *files)
@@ -968,8 +1007,6 @@ void help_text()
 int main(int argc, char **argv) {
   int x;
   int opt;
-  FILE *file1;
-  FILE *file2;
   file_t *files = NULL;
   file_t *curfile;
   file_t **match = NULL;
@@ -1120,29 +1157,7 @@ int main(int argc, char **argv) {
       match = checkmatch(&checktree, checktree, curfile);
 
     if (match != NULL) {
-      file1 = fopen(curfile->d_name, "rb");
-      if (!file1) {
-	curfile = curfile->next;
-	continue;
-      }
-      
-      file2 = fopen((*match)->d_name, "rb");
-      if (!file2) {
-	fclose(file1);
-	curfile = curfile->next;
-	continue;
-      }
-
-      if (confirmmatch(file1, file2)) {
-	registerpair(match, curfile, sort_pairs_by_mtime);
-	
-	/*match->hasdupes = 1;
-        curfile->duplicates = match->duplicates;
-        match->duplicates = curfile;*/
-      }
-      
-      fclose(file1);
-      fclose(file2);
+      registerpair(match, curfile, sort_pairs_by_mtime);
     }
 
     curfile = curfile->next;
